@@ -1,0 +1,442 @@
+// Core Saga interfaces and enums
+public enum SagaStatus {
+PENDING,
+IN_PROGRESS,
+COMPLETED,
+FAILED,
+COMPENSATING,
+COMPENSATED
+}
+
+public enum StepStatus {
+PENDING,
+COMPLETED,
+FAILED,
+COMPENSATED
+}
+
+// Saga context to hold transaction data
+public class SagaContext {
+private final String sagaId;
+private final Map<String, Object> data;
+private final Map<String, Object> metadata;
+
+```
+public SagaContext(String sagaId) {
+    this.sagaId = sagaId;
+    this.data = new ConcurrentHashMap<>();
+    this.metadata = new ConcurrentHashMap<>();
+}
+
+public String getSagaId() { return sagaId; }
+
+public void put(String key, Object value) {
+    data.put(key, value);
+}
+
+public <T> T get(String key, Class<T> type) {
+    return type.cast(data.get(key));
+}
+
+public Object get(String key) {
+    return data.get(key);
+}
+
+public void putMetadata(String key, Object value) {
+    metadata.put(key, value);
+}
+
+public Object getMetadata(String key) {
+    return metadata.get(key);
+}
+
+public Map<String, Object> getAllData() {
+    return new HashMap<>(data);
+}
+```
+
+}
+
+// Saga step interface
+public interface SagaStep {
+String getName();
+StepResult execute(SagaContext context);
+StepResult compensate(SagaContext context);
+}
+
+// Result of step execution
+public class StepResult {
+private final boolean success;
+private final String errorMessage;
+private final Exception exception;
+
+```
+private StepResult(boolean success, String errorMessage, Exception exception) {
+    this.success = success;
+    this.errorMessage = errorMessage;
+    this.exception = exception;
+}
+
+public static StepResult success() {
+    return new StepResult(true, null, null);
+}
+
+public static StepResult failure(String errorMessage) {
+    return new StepResult(false, errorMessage, null);
+}
+
+public static StepResult failure(String errorMessage, Exception exception) {
+    return new StepResult(false, errorMessage, exception);
+}
+
+public boolean isSuccess() { return success; }
+public String getErrorMessage() { return errorMessage; }
+public Exception getException() { return exception; }
+```
+
+}
+
+// Saga definition
+public class SagaDefinition {
+private final String name;
+private final List<SagaStep> steps;
+
+```
+public SagaDefinition(String name, List<SagaStep> steps) {
+    this.name = name;
+    this.steps = new ArrayList<>(steps);
+}
+
+public String getName() { return name; }
+public List<SagaStep> getSteps() { return new ArrayList<>(steps); }
+```
+
+}
+
+// Saga instance representing a running saga
+public class SagaInstance {
+private final String sagaId;
+private final String sagaName;
+private final SagaContext context;
+private SagaStatus status;
+private int currentStepIndex;
+private final Map<String, StepStatus> stepStatuses;
+private final LocalDateTime createdAt;
+private LocalDateTime updatedAt;
+private String errorMessage;
+
+```
+public SagaInstance(String sagaId, String sagaName, SagaContext context) {
+    this.sagaId = sagaId;
+    this.sagaName = sagaName;
+    this.context = context;
+    this.status = SagaStatus.PENDING;
+    this.currentStepIndex = 0;
+    this.stepStatuses = new ConcurrentHashMap<>();
+    this.createdAt = LocalDateTime.now();
+    this.updatedAt = LocalDateTime.now();
+}
+
+// Getters and setters
+public String getSagaId() { return sagaId; }
+public String getSagaName() { return sagaName; }
+public SagaContext getContext() { return context; }
+public SagaStatus getStatus() { return status; }
+public void setStatus(SagaStatus status) { 
+    this.status = status; 
+    this.updatedAt = LocalDateTime.now();
+}
+public int getCurrentStepIndex() { return currentStepIndex; }
+public void setCurrentStepIndex(int currentStepIndex) { 
+    this.currentStepIndex = currentStepIndex; 
+    this.updatedAt = LocalDateTime.now();
+}
+public Map<String, StepStatus> getStepStatuses() { return new HashMap<>(stepStatuses); }
+public void setStepStatus(String stepName, StepStatus status) { 
+    stepStatuses.put(stepName, status); 
+    this.updatedAt = LocalDateTime.now();
+}
+public LocalDateTime getCreatedAt() { return createdAt; }
+public LocalDateTime getUpdatedAt() { return updatedAt; }
+public String getErrorMessage() { return errorMessage; }
+public void setErrorMessage(String errorMessage) { 
+    this.errorMessage = errorMessage; 
+    this.updatedAt = LocalDateTime.now();
+}
+```
+
+}
+
+// Repository interface for saga persistence
+public interface SagaRepository {
+void save(SagaInstance sagaInstance);
+SagaInstance findById(String sagaId);
+List<SagaInstance> findByStatus(SagaStatus status);
+void update(SagaInstance sagaInstance);
+void delete(String sagaId);
+}
+
+// Event listener interface for saga events
+public interface SagaEventListener {
+void onSagaStarted(SagaInstance saga);
+void onSagaCompleted(SagaInstance saga);
+void onSagaFailed(SagaInstance saga);
+void onSagaCompensated(SagaInstance saga);
+void onStepStarted(SagaInstance saga, SagaStep step);
+void onStepCompleted(SagaInstance saga, SagaStep step);
+void onStepFailed(SagaInstance saga, SagaStep step, StepResult result);
+}
+
+// Main Saga Orchestrator
+public class SagaOrchestrator {
+private final Map<String, SagaDefinition> sagaDefinitions;
+private final SagaRepository repository;
+private final List<SagaEventListener> eventListeners;
+private final ExecutorService executorService;
+private final Logger logger = LoggerFactory.getLogger(SagaOrchestrator.class);
+
+```
+public SagaOrchestrator(SagaRepository repository) {
+    this.sagaDefinitions = new ConcurrentHashMap<>();
+    this.repository = repository;
+    this.eventListeners = new ArrayList<>();
+    this.executorService = Executors.newCachedThreadPool();
+}
+
+public void registerSagaDefinition(SagaDefinition definition) {
+    sagaDefinitions.put(definition.getName(), definition);
+    logger.info("Registered saga definition: {}", definition.getName());
+}
+
+public void addEventListener(SagaEventListener listener) {
+    eventListeners.add(listener);
+}
+
+public CompletableFuture<SagaInstance> startSaga(String sagaName, SagaContext context) {
+    SagaDefinition definition = sagaDefinitions.get(sagaName);
+    if (definition == null) {
+        throw new IllegalArgumentException("Saga definition not found: " + sagaName);
+    }
+    
+    SagaInstance saga = new SagaInstance(context.getSagaId(), sagaName, context);
+    saga.setStatus(SagaStatus.IN_PROGRESS);
+    
+    // Initialize step statuses
+    for (SagaStep step : definition.getSteps()) {
+        saga.setStepStatus(step.getName(), StepStatus.PENDING);
+    }
+    
+    repository.save(saga);
+    notifyListeners(l -> l.onSagaStarted(saga));
+    
+    return CompletableFuture.supplyAsync(() -> executeSaga(saga, definition), executorService);
+}
+
+private SagaInstance executeSaga(SagaInstance saga, SagaDefinition definition) {
+    try {
+        List<SagaStep> steps = definition.getSteps();
+        
+        // Execute steps forward
+        for (int i = saga.getCurrentStepIndex(); i < steps.size(); i++) {
+            SagaStep step = steps.get(i);
+            saga.setCurrentStepIndex(i);
+            repository.update(saga);
+            
+            if (!executeStep(saga, step)) {
+                // Step failed, start compensation
+                return compensateSaga(saga, definition);
+            }
+        }
+        
+        // All steps completed successfully
+        saga.setStatus(SagaStatus.COMPLETED);
+        repository.update(saga);
+        notifyListeners(l -> l.onSagaCompleted(saga));
+        logger.info("Saga completed successfully: {}", saga.getSagaId());
+        
+        return saga;
+        
+    } catch (Exception e) {
+        logger.error("Unexpected error in saga execution: {}", saga.getSagaId(), e);
+        saga.setStatus(SagaStatus.FAILED);
+        saga.setErrorMessage("Unexpected error: " + e.getMessage());
+        repository.update(saga);
+        notifyListeners(l -> l.onSagaFailed(saga));
+        return saga;
+    }
+}
+
+private boolean executeStep(SagaInstance saga, SagaStep step) {
+    try {
+        logger.debug("Executing step: {} for saga: {}", step.getName(), saga.getSagaId());
+        notifyListeners(l -> l.onStepStarted(saga, step));
+        
+        StepResult result = step.execute(saga.getContext());
+        
+        if (result.isSuccess()) {
+            saga.setStepStatus(step.getName(), StepStatus.COMPLETED);
+            notifyListeners(l -> l.onStepCompleted(saga, step));
+            logger.debug("Step completed: {} for saga: {}", step.getName(), saga.getSagaId());
+            return true;
+        } else {
+            saga.setStepStatus(step.getName(), StepStatus.FAILED);
+            saga.setErrorMessage(result.getErrorMessage());
+            notifyListeners(l -> l.onStepFailed(saga, step, result));
+            logger.warn("Step failed: {} for saga: {} - {}", 
+                step.getName(), saga.getSagaId(), result.getErrorMessage());
+            return false;
+        }
+        
+    } catch (Exception e) {
+        saga.setStepStatus(step.getName(), StepStatus.FAILED);
+        saga.setErrorMessage("Step execution error: " + e.getMessage());
+        logger.error("Step execution error: {} for saga: {}", step.getName(), saga.getSagaId(), e);
+        return false;
+    }
+}
+
+private SagaInstance compensateSaga(SagaInstance saga, SagaDefinition definition) {
+    logger.info("Starting compensation for saga: {}", saga.getSagaId());
+    saga.setStatus(SagaStatus.COMPENSATING);
+    repository.update(saga);
+    
+    List<SagaStep> steps = definition.getSteps();
+    
+    // Compensate completed steps in reverse order
+    for (int i = saga.getCurrentStepIndex(); i >= 0; i--) {
+        SagaStep step = steps.get(i);
+        StepStatus stepStatus = saga.getStepStatuses().get(step.getName());
+        
+        if (stepStatus == StepStatus.COMPLETED) {
+            try {
+                logger.debug("Compensating step: {} for saga: {}", step.getName(), saga.getSagaId());
+                StepResult result = step.compensate(saga.getContext());
+                
+                if (result.isSuccess()) {
+                    saga.setStepStatus(step.getName(), StepStatus.COMPENSATED);
+                    logger.debug("Step compensated: {} for saga: {}", step.getName(), saga.getSagaId());
+                } else {
+                    logger.error("Compensation failed for step: {} in saga: {} - {}", 
+                        step.getName(), saga.getSagaId(), result.getErrorMessage());
+                    // Continue with other compensations even if one fails
+                }
+                
+            } catch (Exception e) {
+                logger.error("Compensation error for step: {} in saga: {}", 
+                    step.getName(), saga.getSagaId(), e);
+                // Continue with other compensations
+            }
+        }
+    }
+    
+    saga.setStatus(SagaStatus.COMPENSATED);
+    repository.update(saga);
+    notifyListeners(l -> l.onSagaCompensated(saga));
+    logger.info("Saga compensation completed: {}", saga.getSagaId());
+    
+    return saga;
+}
+
+public SagaInstance getSaga(String sagaId) {
+    return repository.findById(sagaId);
+}
+
+public List<SagaInstance> getSagasByStatus(SagaStatus status) {
+    return repository.findByStatus(status);
+}
+
+private void notifyListeners(Consumer<SagaEventListener> action) {
+    for (SagaEventListener listener : eventListeners) {
+        try {
+            action.accept(listener);
+        } catch (Exception e) {
+            logger.warn("Error notifying saga event listener", e);
+        }
+    }
+}
+
+public void shutdown() {
+    executorService.shutdown();
+    try {
+        if (!executorService.awaitTermination(30, TimeUnit.SECONDS)) {
+            executorService.shutdownNow();
+        }
+    } catch (InterruptedException e) {
+        executorService.shutdownNow();
+        Thread.currentThread().interrupt();
+    }
+}
+```
+
+}
+
+// Example implementation of a saga step
+public abstract class AbstractSagaStep implements SagaStep {
+protected final String name;
+protected final Logger logger = LoggerFactory.getLogger(getClass());
+
+```
+protected AbstractSagaStep(String name) {
+    this.name = name;
+}
+
+@Override
+public String getName() {
+    return name;
+}
+
+@Override
+public StepResult compensate(SagaContext context) {
+    // Default implementation - override if compensation is needed
+    logger.info("No compensation required for step: {}", name);
+    return StepResult.success();
+}
+```
+
+}
+
+// In-memory repository implementation for testing
+public class InMemorySagaRepository implements SagaRepository {
+private final Map<String, SagaInstance> sagas = new ConcurrentHashMap<>();
+
+```
+@Override
+public void save(SagaInstance sagaInstance) {
+    sagas.put(sagaInstance.getSagaId(), sagaInstance);
+}
+
+@Override
+public SagaInstance findById(String sagaId) {
+    return sagas.get(sagaId);
+}
+
+@Override
+public List<SagaInstance> findByStatus(SagaStatus status) {
+    return sagas.values().stream()
+        .filter(saga -> saga.getStatus() == status)
+        .collect(Collectors.toList());
+}
+
+@Override
+public void update(SagaInstance sagaInstance) {
+    sagas.put(sagaInstance.getSagaId(), sagaInstance);
+}
+
+@Override
+public void delete(String sagaId) {
+    sagas.remove(sagaId);
+}
+```
+
+}
+
+// Required imports (add these at the top of your file)
+/*
+import java.time.LocalDateTime;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.function.Consumer;
+import java.util.stream.Collectors;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+*/
